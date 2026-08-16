@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+  <meta name="theme-color" content="#17324d" />
+  <title>VIP Tracker</title>
+  <link rel="manifest" href="manifest.webmanifest" />
+  <link rel="stylesheet" href="styles.css" />
+  <link rel="apple-touch-icon" href="icon-192.png" />
+</head>
+<body>
+  <header class="app-header">
+    <div>
+      <h1>VIP Tracker</h1>
+      <p>Victor's Innings Pitch Tracker</p>
+    </div>
+    <button id="installBtn" class="secondary hidden">Install</button>
+  </header>
+
+  <main id="app"></main>
+
+  <nav class="bottom-nav">
+    <button data-route="home">Home</button>
+    <button data-route="pitchers">Pitchers</button>
+    <button data-route="appearances">Appearances</button>
+    <button data-route="settings">Settings</button>
+  </nav>
+
+  <template id="modalTemplate">
+    <div class="modal-backdrop">
+      <section class="modal">
+        <div class="modal-content"></div>
+      </section>
+    </div>
+  </template>
+
+  <script src="app.js"></script>
+</body>
+</html>
