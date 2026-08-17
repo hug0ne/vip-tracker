@@ -8,6 +8,7 @@
   --brand2:#2d5d7b;
   --accent:#d7a21a;
   --danger:#a52a2a;
+  --undo:#e2622a;
   --ok:#2e6b45;
   --line:#d9e2ea;
 }
@@ -45,13 +46,15 @@ main { padding:16px 16px 90px; max-width:850px; margin:auto; }
 .grid.two { grid-template-columns:repeat(2,minmax(0,1fr)); }
 .grid.three { grid-template-columns:repeat(3,minmax(0,1fr)); }
 .grid.five { grid-template-columns:repeat(5,minmax(0,1fr)); }
-.primary,.secondary,.danger,.success,.pitch-btn,.outcome-btn {
+.primary,.secondary,.danger,.success,.undo,.pitch-btn,.outcome-btn,.wp-btn {
   border:0; border-radius:12px; padding:13px 14px; font-weight:700;
 }
 .primary { background:var(--brand); color:white; }
 .secondary { background:#e8eef4; color:var(--brand); }
 .danger { background:#f6dddd; color:var(--danger); }
 .success { background:#dcecdf; color:var(--ok); }
+.undo { background:#fbe1d3; color:var(--undo); }
+.undo:disabled { opacity:.5; cursor:not-allowed; }
 .full { width:100%; }
 .hidden { display:none !important; }
 label { display:block; font-size:.9rem; font-weight:700; margin:10px 0 5px; }
@@ -71,11 +74,24 @@ textarea { min-height:88px; resize:vertical; }
 .stat strong { display:block; font-size:1.35rem; }
 .stat span { font-size:.75rem; color:var(--muted); }
 .pitch-btn {
-  background:var(--brand2); color:white; min-height:66px; font-size:1.15rem;
+  background:var(--brand2); color:white; min-height:66px;
+  font-size:clamp(0.72rem, 3.6vw, 1.15rem); padding:10px 6px;
 }
 .pitch-btn.ball { background:#7b4c2d; }
 .pitch-btn.foul { background:#6b5b22; }
+.pitch-btn.small { min-height:44px; padding:8px 4px; }
 .outcome-btn { background:#e8eef4; color:var(--brand); min-height:54px; }
+.outcome-btn.safe-choice { background:#dcecdf; color:var(--ok); min-height:64px; font-size:1.1rem; }
+.outcome-btn.out-choice { background:#f6dddd; color:var(--danger); min-height:64px; font-size:1.1rem; }
+.wp-btn { background:#fdeccb; color:#7a5b00; font-size:.85rem; padding:9px 6px; }
+.wp-btn:disabled { opacity:.4; cursor:not-allowed; }
+.bases-row { display:flex; gap:10px; margin-top:8px; }
+.base-pill {
+  flex:1; border:2px solid var(--line); border-radius:12px; padding:14px 8px;
+  background:#eef3f7; color:var(--muted); font-weight:800; text-align:center;
+}
+.base-pill.on { background:var(--brand); color:white; border-color:var(--brand); }
+.sequence span[data-remove-pitch] { cursor:pointer; }
 .badge {
   display:inline-block; padding:4px 8px; border-radius:999px;
   background:#e8eef4; color:var(--brand); font-size:.78rem; font-weight:700;

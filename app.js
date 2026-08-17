@@ -1,4 +1,3 @@
-
 'use strict';
 
 const STORE_KEY = 'vipTrackerDataV1';
@@ -51,26 +50,159 @@ function formatIP(outs) {
   return `${Math.floor(outs / 3)}.${outs % 3}`;
 }
 
+/* ---------------------------------------------------------------------- */
+/* Outcome catalog                                                         */
+/* ---------------------------------------------------------------------- */
+
+const STRIKEOUT_CODES = ['K', 'KL', 'D3O', 'D3R'];
+const WALK_CODES = ['BB', 'IBB'];
+const HIT_CODES = ['1B', '2B', '3B', 'HR'];
+
+const SAFE_TYPES = [
+  { code: 'BB',  label: 'Walk', outs: 0 },
+  { code: 'IBB', label: 'Intentional Walk', outs: 0 },
+  { code: 'HBP', label: 'Hit By Pitch', outs: 0 },
+  { code: '1B',  label: 'Single', outs: 0 },
+  { code: '2B',  label: 'Double', outs: 0 },
+  { code: '3B',  label: 'Triple', outs: 0 },
+  { code: 'HR',  label: 'Home Run', outs: 0 },
+  { code: 'FC',  label: "Fielder's Choice", outs: 1, needsRunner: true },
+  { code: 'ROE', label: 'Reached on Error', outs: 0 },
+  { code: 'CI',  label: "Catcher's Interference", outs: 0 },
+  { code: 'DI',  label: 'Defensive Interference', outs: 0 },
+  { code: 'BT',  label: 'Bunt', outs: 0 },
+  { code: 'D3R', label: 'Dropped 3rd Strike – Reached', outs: 0 },
+  { code: 'OTHER', label: 'Other', outs: 0 }
+];
+
+// Special group code handled separately in the picker UI.
+const OUT_TYPES = [
+  { code: 'STRIKEOUT', label: 'Strikeout', outs: 1, group: true },
+  { code: 'GO',  label: 'Groundout', outs: 1 },
+  { code: 'COMEBACKER', label: 'Come-backer to Pitcher', outs: 1 },
+  { code: 'D3O', label: 'Dropped 3rd Strike – Out', outs: 1 },
+  { code: 'FO',  label: 'Flyout', outs: 1 },
+  { code: 'LO',  label: 'Lineout', outs: 1 },
+  { code: 'PO',  label: 'Popout', outs: 1 },
+  { code: 'FORCE', label: 'Force Out', outs: 1, needsRunner: true },
+  { code: 'TAG', label: 'Tag Out', outs: 1, needsRunner: true },
+  { code: 'DP',  label: 'Double Play', outs: 2, needsRunner: true },
+  { code: 'TP',  label: 'Triple Play', outs: 3, clearsBases: true },
+  { code: 'IFR', label: 'Infield Fly Rule Out', outs: 1 }
+];
+
+function findOutcomeMeta(code) {
+  if (code === 'K') return { code: 'K', label: 'Strikeout – Swinging', outs: 1 };
+  if (code === 'KL') return { code: 'KL', label: 'Strikeout – Looking', outs: 1 };
+  return SAFE_TYPES.find(o => o.code === code) || OUT_TYPES.find(o => o.code === code);
+}
+
+function outcomeLabel(code) {
+  const meta = findOutcomeMeta(code);
+  return meta ? meta.label : (code || '—');
+}
+
+/* ---------------------------------------------------------------------- */
+/* Base-running rules (simple boolean occupancy, semi-automatic)           */
+/* ---------------------------------------------------------------------- */
+
+function emptyBases() { return { first: false, second: false, third: false }; }
+
+// Batter reaches first, forces only the runners that must move.
+function forceAdvanceFromFirst(bases) {
+  let { first, second, third } = bases;
+  if (first) {
+    if (second) {
+      third = true; // former 2nd runner forced to 3rd (former 3rd runner scores if occupied)
+      second = true; // former 1st runner forced to 2nd
+    } else {
+      second = true;
+    }
+  }
+  first = true;
+  return { first, second, third };
+}
+
+// Everyone (existing runners) advances exactly one base; batter takes first.
+function shiftBasesByOne(bases) {
+  return { first: true, second: bases.first, third: bases.second };
+}
+
+// A wild pitch / passed ball: existing runners each advance one base, no batter added.
+function advanceOnMissedPitch(bases) {
+  return { first: false, second: bases.first, third: bases.second };
+}
+
+function applyAdvancement(bases, code, runnerOutBase) {
+  switch (code) {
+    case '1B': case 'BT': case 'ROE':
+      return shiftBasesByOne(bases);
+    case '2B':
+      return { first: false, second: true, third: bases.first };
+    case '3B':
+      return { first: false, second: false, third: true };
+    case 'HR':
+      return emptyBases();
+    case 'BB': case 'IBB': case 'HBP': case 'CI': case 'DI': case 'OTHER': case 'D3R':
+      return forceAdvanceFromFirst(bases);
+    case 'FC': case 'FORCE': case 'TAG': {
+      const without = { ...bases };
+      if (runnerOutBase) without[runnerOutBase] = false;
+      return forceAdvanceFromFirst(without);
+    }
+    case 'DP': {
+      const without = { ...bases };
+      if (runnerOutBase) without[runnerOutBase] = false;
+      return without;
+    }
+    case 'TP':
+      return emptyBases();
+    default:
+      return { ...bases }; // K, KL, GO, COMEBACKER, D3O, FO, LO, PO, IFR: unchanged
+  }
+}
+
+function baseLabel(key) {
+  return key === 'first' ? '1st' : key === 'second' ? '2nd' : '3rd';
+}
+
+/* ---------------------------------------------------------------------- */
+/* Derived stats (always computed from batters, never drift)               */
+/* ---------------------------------------------------------------------- */
+
+function computeTotals(a) {
+  let outs = 0, runs = 0, earnedRuns = 0, errors = 0;
+  for (const b of a.batters) {
+    if (!b.completed) continue;
+    outs += b.outsRecorded || 0;
+    runs += b.runs || 0;
+    earnedRuns += b.earnedRuns || 0;
+    errors += b.errors || 0;
+  }
+  return { outs, runs, earnedRuns, errors };
+}
+
 function statsFor(a) {
   const pitches = a.batters.flatMap(b => b.pitches || []);
   const strikes = pitches.filter(p => ['SL','SW','F','DK'].includes(p.result)).length;
   const balls = pitches.filter(p => p.result === 'B').length;
   const batters = a.batters.filter(b => b.completed).length;
   const firstPitchStrikes = a.batters.filter(b => b.completed && ['SL','SW','F','DK'].includes(b.pitches?.[0]?.result)).length;
-  const strikeouts = a.batters.filter(b => ['K','KL'].includes(b.outcome)).length;
+  const strikeouts = a.batters.filter(b => STRIKEOUT_CODES.includes(b.outcome)).length;
   const looking = a.batters.filter(b => b.outcome === 'KL').length;
-  const walks = a.batters.filter(b => b.outcome === 'BB').length;
-  const hits = a.batters.filter(b => ['1B','2B','3B','HR'].includes(b.outcome)).length;
+  const walks = a.batters.filter(b => WALK_CODES.includes(b.outcome)).length;
+  const hits = a.batters.filter(b => HIT_CODES.includes(b.outcome)).length;
   const total = pitches.length;
+  const totals = computeTotals(a);
   return {
     total, strikes, balls, batters, firstPitchStrikes, strikeouts, looking, walks, hits,
     strikePct: total ? (strikes / total * 100) : 0,
     firstPitchPct: batters ? (firstPitchStrikes / batters * 100) : 0,
     avgPerBatter: batters ? total / batters : 0,
-    ip: formatIP(a.pitcherOuts || 0),
-    runs: a.runs || 0,
-    earnedRuns: a.earnedRuns || 0,
-    errors: a.errors || 0
+    ip: formatIP(totals.outs),
+    runs: totals.runs,
+    earnedRuns: totals.earnedRuns,
+    errors: totals.errors
   };
 }
 
@@ -229,15 +361,16 @@ function renderNewAppearance() {
   document.getElementById('appearanceForm').addEventListener('submit', e => {
     e.preventDefault();
     const f = new FormData(e.target);
+    const inherited = { first: !!f.get('r1'), second: !!f.get('r2'), third: !!f.get('r3') };
     const a = {
       id:uid('appearance'), pitcherId:f.get('pitcherId'), date:f.get('date'),
       team:f.get('team').trim(), opponent:f.get('opponent').trim(),
       location:f.get('location').trim(), inning:Number(f.get('inning')),
-      half:f.get('half'), entryOuts:Number(f.get('outs')), currentOuts:Number(f.get('outs')),
-      pitcherOuts:0, pitchLimit:Number(f.get('pitchLimit')) || null,
-      inherited:{first:!!f.get('r1'),second:!!f.get('r2'),third:!!f.get('r3')},
-      batters:[], currentBatter:null, runs:0, earnedRuns:0, errors:0,
-      createdAt:Date.now(), endedAt:null, endReason:''
+      startInning:Number(f.get('inning')), half:f.get('half'),
+      entryOuts:Number(f.get('outs')), currentOuts:Number(f.get('outs')),
+      pitchLimit:Number(f.get('pitchLimit')) || null,
+      inherited, bases: { ...inherited },
+      batters:[], currentBatter:null, createdAt:Date.now(), endedAt:null, endReason:''
     };
     data.appearances.push(a);
     data.activeAppearanceId = a.id;
@@ -250,7 +383,7 @@ function renderNewAppearance() {
 function startNextBatter(a) {
   a.currentBatter = {
     id:uid('batter'), jersey:'', order:a.batters.length + 1,
-    pitches:[], outcome:null, completed:false, outsRecorded:0, runs:0, earnedRuns:0
+    pitches:[], outcome:null, completed:false, outsRecorded:0, runs:0, earnedRuns:0, errors:0, runnerOutBase:null
   };
   saveData();
 }
@@ -265,14 +398,24 @@ function currentCount(b) {
   return {balls,strikes};
 }
 
+function pitchLabel(code) {
+  return { SL:'SL', SW:'SW', B:'Ball', F:'Foul', DK:'Drop K' }[code] || code;
+}
+
+/* ---------------------------------------------------------------------- */
+/* Tracker screen                                                          */
+/* ---------------------------------------------------------------------- */
+
 function renderTracker() {
   const a = activeAppearance();
   if (!a) return navigate('home');
+  if (!a.bases) a.bases = { ...(a.inherited || emptyBases()) };
   if (!a.currentBatter) startNextBatter(a);
   const b = a.currentBatter;
   const s = statsFor(a);
   const c = currentCount(b);
   const nearLimit = a.pitchLimit && s.total >= a.pitchLimit - 5;
+  const completedBatters = [...a.batters].reverse();
   app.innerHTML = `
     ${nearLimit ? `<div class="alert">Pitch count is ${s.total}. Limit: ${a.pitchLimit}.</div>` : ''}
     <section class="card">
@@ -285,19 +428,25 @@ function renderTracker() {
       </div>
       <label>Batter jersey number</label>
       <input id="batterJersey" inputmode="numeric" value="${esc(b.jersey)}" placeholder="Enter jersey number">
-      <div class="sequence">${b.pitches.map(p=>`<span>${esc(p.result)}</span>`).join('')}</div>
+      <div class="sequence">${b.pitches.map(p=>`<span>${esc(pitchLabel(p.result))}${p.advance ? ` · ${p.advance}` : ''}</span>`).join('')}</div>
     </section>
+
+    ${renderBasesWidget(a)}
 
     <section class="card">
       <div class="grid five">
         <button class="pitch-btn" data-pitch="SL">SL</button>
         <button class="pitch-btn" data-pitch="SW">SW</button>
-        <button class="pitch-btn ball" data-pitch="B">B</button>
-        <button class="pitch-btn foul" data-pitch="F">F</button>
-        <button class="pitch-btn" data-pitch="DK">DK</button>
+        <button class="pitch-btn ball" data-pitch="B">Ball</button>
+        <button class="pitch-btn foul" data-pitch="F">Foul</button>
+        <button class="pitch-btn" data-pitch="DK">Drop K</button>
+      </div>
+      <div class="grid two" style="margin-top:10px">
+        <button class="wp-btn" id="wildPitchBtn" ${!b.pitches.length ? 'disabled' : ''}>Wild Pitch</button>
+        <button class="wp-btn" id="passedBallBtn" ${!b.pitches.length ? 'disabled' : ''}>Passed Ball</button>
       </div>
       <div class="grid two" style="margin-top:12px">
-        <button class="secondary" id="undoBtn">Undo Last Pitch</button>
+        <button class="undo" id="undoBtn">Undo Last Pitch</button>
         <button class="primary" id="outcomeBtn">Record Outcome</button>
       </div>
     </section>
@@ -318,24 +467,270 @@ function renderTracker() {
         <button class="secondary" id="advanceInningBtn">Advance Inning</button>
         <button class="danger" id="endAppearanceBtn">End Appearance</button>
       </div>
-    </section>`;
+    </section>
+
+    ${completedBatters.length ? `
+    <section class="card">
+      <h3 class="section-title">This Game – Tap to Fix a Batter</h3>
+      ${completedBatters.map((cb,i) => `
+        <div class="list-item" data-edit-batter="${cb.id}">
+          <div><strong>${completedBatters.length - i}. Batter #${esc(cb.jersey || '—')}</strong><br>
+          <span class="muted">${(cb.pitches||[]).map(p=>esc(pitchLabel(p.result))).join(' · ') || 'No pitches'}</span></div>
+          <span class="badge">${esc(outcomeLabel(cb.outcome))}</span>
+        </div>`).join('')}
+    </section>` : ''}
+  `;
   document.getElementById('batterJersey').addEventListener('input', e => {
     b.jersey = e.target.value.trim();
     document.getElementById('batterNumberLabel').textContent = b.jersey || '—';
     saveData();
   });
   app.querySelectorAll('[data-pitch]').forEach(btn => btn.addEventListener('click', () => {
-    b.pitches.push({ id:uid('pitch'), result:btn.dataset.pitch, at:Date.now(), pitchType:null, velocity:null });
+    b.pitches.push({ id:uid('pitch'), result:btn.dataset.pitch, at:Date.now(), pitchType:null, velocity:null, advance:null });
     saveData(); renderTracker();
   }));
+  document.getElementById('wildPitchBtn')?.addEventListener('click', () => {
+    if (!b.pitches.length) return;
+    b.pitches[b.pitches.length-1].advance = 'WP';
+    a.bases = advanceOnMissedPitch(a.bases);
+    saveData(); renderTracker();
+  });
+  document.getElementById('passedBallBtn')?.addEventListener('click', () => {
+    if (!b.pitches.length) return;
+    b.pitches[b.pitches.length-1].advance = 'PB';
+    a.bases = advanceOnMissedPitch(a.bases);
+    saveData(); renderTracker();
+  });
   document.getElementById('undoBtn').addEventListener('click', () => {
     b.pitches.pop(); saveData(); renderTracker();
   });
-  document.getElementById('outcomeBtn').addEventListener('click', () => showOutcomeModal(a,b));
+  document.getElementById('outcomeBtn').addEventListener('click', () => openOutcomeEditor(a, { onDone: () => renderTracker() }));
   document.getElementById('advanceInningBtn').addEventListener('click', () => {
     a.inning += 1; a.currentOuts = 0; saveData(); renderTracker();
   });
   document.getElementById('endAppearanceBtn').addEventListener('click', () => showEndModal(a));
+  app.querySelectorAll('[data-base]').forEach(btn => btn.addEventListener('click', () => {
+    const key = btn.dataset.base;
+    a.bases[key] = !a.bases[key];
+    saveData(); renderTracker();
+  }));
+  app.querySelectorAll('[data-edit-batter]').forEach(row => row.addEventListener('click', () => {
+    const batter = a.batters.find(x => x.id === row.dataset.editBatter);
+    if (batter) openOutcomeEditor(a, { existingBatter: batter, onDone: () => renderTracker() });
+  }));
+}
+
+function renderBasesWidget(a) {
+  const bases = a.bases || emptyBases();
+  return `
+    <section class="card">
+      <div class="kicker">Runners on Base · tap to correct</div>
+      <div class="bases-row">
+        <button class="base-pill ${bases.first ? 'on' : ''}" data-base="first">1st</button>
+        <button class="base-pill ${bases.second ? 'on' : ''}" data-base="second">2nd</button>
+        <button class="base-pill ${bases.third ? 'on' : ''}" data-base="third">3rd</button>
+      </div>
+    </section>`;
+}
+
+/* ---------------------------------------------------------------------- */
+/* Outcome editor (used for recording AND editing a batter)                */
+/* ---------------------------------------------------------------------- */
+
+function openOutcomeEditor(a, { existingBatter, onDone }) {
+  const isEdit = !!existingBatter;
+  const target = existingBatter || a.currentBatter;
+  const state = {
+    stage: isEdit && target.outcome ? 'detail' : 'category',
+    category: isEdit ? (SAFE_TYPES.some(t => t.code === target.outcome) ? 'safe' : 'out') : null,
+    code: isEdit ? target.outcome : null,
+    runnerOutBase: isEdit ? target.runnerOutBase : null,
+    outs: isEdit ? target.outsRecorded : 0,
+    runs: isEdit ? target.runs : 0,
+    earnedRuns: isEdit ? target.earnedRuns : 0,
+    errors: isEdit ? target.errors : 0,
+    pitches: isEdit ? [...(target.pitches || [])] : null
+  };
+
+  const tpl = document.getElementById('modalTemplate');
+  const node = tpl.content.cloneNode(true);
+  document.body.appendChild(node);
+  const backdrop = document.querySelector('.modal-backdrop:last-of-type');
+  const content = backdrop.querySelector('.modal-content');
+
+  function occupiedBases() {
+    return Object.keys(a.bases || {}).filter(k => a.bases[k]);
+  }
+
+  function renderStage() {
+    if (state.stage === 'category') {
+      content.innerHTML = `
+        <h3>${isEdit ? 'Edit Outcome' : 'Record Batter Outcome'}</h3>
+        <div class="grid two">
+          <button class="outcome-btn safe-choice" id="pickSafe">Safe</button>
+          <button class="outcome-btn out-choice" id="pickOut">Out</button>
+        </div>
+        <button class="secondary full" id="cancelModal" style="margin-top:12px">Cancel</button>`;
+      content.querySelector('#pickSafe').addEventListener('click', () => { state.category = 'safe'; state.stage = 'type'; renderStage(); });
+      content.querySelector('#pickOut').addEventListener('click', () => { state.category = 'out'; state.stage = 'type'; renderStage(); });
+      content.querySelector('#cancelModal').addEventListener('click', () => backdrop.remove());
+      return;
+    }
+
+    if (state.stage === 'type') {
+      const occ = occupiedBases();
+      const list = state.category === 'safe' ? SAFE_TYPES : OUT_TYPES;
+      const visible = list.filter(o => {
+        if (['FC','FORCE','TAG','DP','TP'].includes(o.code)) return occ.length > 0;
+        return true;
+      });
+      content.innerHTML = `
+        <h3>${state.category === 'safe' ? 'How did they reach base?' : 'What kind of out?'}</h3>
+        <div class="grid three">
+          ${visible.map(o => `<button class="outcome-btn" data-code="${o.code}">${esc(o.label)}</button>`).join('')}
+        </div>
+        <button class="secondary full" id="backBtn" style="margin-top:12px">Back</button>
+      `;
+      content.querySelectorAll('[data-code]').forEach(btn => btn.addEventListener('click', () => {
+        const code = btn.dataset.code;
+        if (code === 'STRIKEOUT') { state.stage = 'strikeoutSub'; renderStage(); return; }
+        const meta = findOutcomeMeta(code);
+        state.code = code;
+        state.outs = meta.outs;
+        if (meta.needsRunner) { state.stage = 'runner'; renderStage(); }
+        else { state.stage = 'detail'; renderStage(); }
+      }));
+      content.querySelector('#backBtn').addEventListener('click', () => { state.stage = 'category'; renderStage(); });
+      return;
+    }
+
+    if (state.stage === 'strikeoutSub') {
+      content.innerHTML = `
+        <h3>Strikeout – Swinging or Looking?</h3>
+        <div class="grid two">
+          <button class="outcome-btn" data-code="K">Swinging</button>
+          <button class="outcome-btn" data-code="KL">Looking</button>
+        </div>
+        <button class="secondary full" id="backBtn" style="margin-top:12px">Back</button>`;
+      content.querySelectorAll('[data-code]').forEach(btn => btn.addEventListener('click', () => {
+        state.code = btn.dataset.code;
+        state.outs = 1;
+        state.stage = 'detail';
+        renderStage();
+      }));
+      content.querySelector('#backBtn').addEventListener('click', () => { state.stage = 'type'; renderStage(); });
+      return;
+    }
+
+    if (state.stage === 'runner') {
+      const occ = occupiedBases();
+      content.innerHTML = `
+        <h3>Which runner was put out?</h3>
+        <div class="grid three">
+          ${occ.map(k => `<button class="outcome-btn" data-runner="${k}">Runner on ${baseLabel(k)}</button>`).join('')}
+        </div>
+        <button class="secondary full" id="backBtn" style="margin-top:12px">Back</button>`;
+      content.querySelectorAll('[data-runner]').forEach(btn => btn.addEventListener('click', () => {
+        state.runnerOutBase = btn.dataset.runner;
+        state.stage = 'detail';
+        renderStage();
+      }));
+      content.querySelector('#backBtn').addEventListener('click', () => { state.stage = 'type'; renderStage(); });
+      return;
+    }
+
+    if (state.stage === 'detail') {
+      const meta = findOutcomeMeta(state.code);
+      content.innerHTML = `
+        <h3>${esc(meta ? meta.label : 'Outcome')}</h3>
+        ${isEdit ? `
+        <div class="kicker">Pitch Sequence</div>
+        <div class="sequence" id="pitchChips">
+          ${state.pitches.map((p,i)=>`<span data-remove-pitch="${i}">${esc(pitchLabel(p.result))}${p.advance ? ' · '+p.advance : ''} ✕</span>`).join('') || '<span class="muted">No pitches recorded</span>'}
+        </div>
+        <div class="grid five" style="margin-top:8px">
+          <button class="pitch-btn small" data-add-pitch="SL">SL</button>
+          <button class="pitch-btn small" data-add-pitch="SW">SW</button>
+          <button class="pitch-btn small ball" data-add-pitch="B">Ball</button>
+          <button class="pitch-btn small foul" data-add-pitch="F">Foul</button>
+          <button class="pitch-btn small" data-add-pitch="DK">Drop K</button>
+        </div>` : ''}
+        <div class="row" style="margin-top:12px">
+          <div><label>Outs recorded</label><select id="outsRecorded"><option>0</option><option>1</option><option>2</option><option>3</option></select></div>
+          <div><label>Runs scored</label><input id="runsScored" type="number" min="0" value="${state.runs||0}"></div>
+        </div>
+        <div class="row">
+          <div><label>Earned runs</label><input id="earnedRuns" type="number" min="0" value="${state.earnedRuns||0}"></div>
+          <div><label>Errors</label><input id="errors" type="number" min="0" value="${state.errors||0}"></div>
+        </div>
+        <button class="primary full" id="saveOutcome" style="margin-top:12px">${isEdit ? 'Save Changes' : 'Save and Next Batter'}</button>
+        <button class="secondary full" id="changeType" style="margin-top:10px">Change Outcome Type</button>
+        <button class="secondary full" id="cancelModal" style="margin-top:10px">Cancel</button>
+      `;
+      content.querySelector('#outsRecorded').value = String(state.outs || 0);
+      if (isEdit) {
+        content.querySelectorAll('[data-remove-pitch]').forEach(chip => chip.addEventListener('click', () => {
+          state.pitches.splice(Number(chip.dataset.removePitch), 1);
+          renderStage();
+        }));
+        content.querySelectorAll('[data-add-pitch]').forEach(btn => btn.addEventListener('click', () => {
+          state.pitches.push({ id: uid('pitch'), result: btn.dataset.addPitch, at: Date.now(), pitchType: null, velocity: null, advance: null });
+          renderStage();
+        }));
+      }
+      content.querySelector('#saveOutcome').addEventListener('click', () => {
+        state.outs = Number(content.querySelector('#outsRecorded').value);
+        state.runs = Number(content.querySelector('#runsScored').value) || 0;
+        state.earnedRuns = Number(content.querySelector('#earnedRuns').value) || 0;
+        state.errors = Number(content.querySelector('#errors').value) || 0;
+        commit();
+      });
+      content.querySelector('#changeType').addEventListener('click', () => { state.stage = 'type'; renderStage(); });
+      content.querySelector('#cancelModal').addEventListener('click', () => backdrop.remove());
+      return;
+    }
+  }
+
+  function commit() {
+    if (isEdit) {
+      const prevOuts = target.outsRecorded || 0;
+      target.jersey = target.jersey || '';
+      if (state.pitches) target.pitches = state.pitches;
+      target.outcome = state.code;
+      target.completed = true;
+      target.runnerOutBase = state.runnerOutBase || null;
+      target.outsRecorded = state.outs;
+      target.runs = state.runs;
+      target.earnedRuns = state.earnedRuns;
+      target.errors = state.errors;
+      const delta = target.outsRecorded - prevOuts;
+      if (delta !== 0) {
+        let total = (a.currentOuts || 0) + delta;
+        while (total < 0) { total += 3; a.inning -= 1; }
+        while (total >= 3) { total -= 3; a.inning += 1; }
+        a.currentOuts = total;
+      }
+    } else {
+      const b = a.currentBatter;
+      b.outcome = state.code;
+      b.completed = true;
+      b.runnerOutBase = state.runnerOutBase || null;
+      b.outsRecorded = state.outs;
+      b.runs = state.runs;
+      b.earnedRuns = state.earnedRuns;
+      b.errors = state.errors;
+      a.currentOuts += b.outsRecorded;
+      a.bases = applyAdvancement(a.bases, b.outcome, b.runnerOutBase);
+      a.batters.push(b);
+      while (a.currentOuts >= 3) { a.currentOuts -= 3; a.inning += 1; }
+      startNextBatter(a);
+    }
+    saveData();
+    backdrop.remove();
+    onDone && onDone();
+  }
+
+  renderStage();
 }
 
 function showModal(html, bind) {
@@ -347,56 +742,6 @@ function showModal(html, bind) {
   bind(backdrop);
 }
 function closeModal(backdrop) { backdrop.remove(); }
-
-function showOutcomeModal(a,b) {
-  const outcomes = [
-    ['K','K Swinging',1],['KL','Ʞ Looking',1],['BB','Walk',0],['HBP','Hit By Pitch',0],
-    ['1B','Single',0],['2B','Double',0],['3B','Triple',0],['HR','Home Run',0],
-    ['GO','Groundout',1],['FO','Flyout',1],['LO','Lineout',1],['FC',"Fielder's Choice",0],
-    ['ROE','Reached on Error',0],['CI',"Catcher's Interference",0],['BT','Bunt',0],['OTHER','Other',0]
-  ];
-  showModal(`
-    <h3>Record Batter Outcome</h3>
-    <div class="grid three">
-      ${outcomes.map(o=>`<button class="outcome-btn" data-code="${o[0]}" data-default-outs="${o[2]}">${o[1]}</button>`).join('')}
-    </div>
-    <div id="detailFields" class="hidden">
-      <div class="row">
-        <div><label>Outs recorded</label><select id="outsRecorded"><option>0</option><option>1</option><option>2</option><option>3</option></select></div>
-        <div><label>Runs scored</label><input id="runsScored" type="number" min="0" value="0"></div>
-      </div>
-      <div class="row">
-        <div><label>Earned runs</label><input id="earnedRuns" type="number" min="0" value="0"></div>
-        <div><label>Errors</label><input id="errors" type="number" min="0" value="0"></div>
-      </div>
-      <button class="primary full" id="saveOutcome" style="margin-top:12px">Save and Next Batter</button>
-    </div>
-    <button class="secondary full" id="cancelModal" style="margin-top:12px">Cancel</button>
-  `, backdrop => {
-    let selected = null;
-    backdrop.querySelectorAll('[data-code]').forEach(btn => btn.addEventListener('click', () => {
-      selected = btn.dataset.code;
-      backdrop.querySelector('#detailFields').classList.remove('hidden');
-      backdrop.querySelector('#outsRecorded').value = btn.dataset.defaultOuts;
-    }));
-    backdrop.querySelector('#saveOutcome').addEventListener('click', () => {
-      if (!selected) return;
-      b.outcome = selected; b.completed = true;
-      b.outsRecorded = Number(backdrop.querySelector('#outsRecorded').value);
-      b.runs = Number(backdrop.querySelector('#runsScored').value) || 0;
-      b.earnedRuns = Number(backdrop.querySelector('#earnedRuns').value) || 0;
-      b.errors = Number(backdrop.querySelector('#errors').value) || 0;
-      a.pitcherOuts += b.outsRecorded;
-      a.currentOuts += b.outsRecorded;
-      a.runs += b.runs; a.earnedRuns += b.earnedRuns; a.errors += b.errors;
-      a.batters.push(b);
-      while (a.currentOuts >= 3) { a.currentOuts -= 3; a.inning += 1; }
-      startNextBatter(a);
-      saveData(); closeModal(backdrop); renderTracker();
-    });
-    backdrop.querySelector('#cancelModal').addEventListener('click', () => closeModal(backdrop));
-  });
-}
 
 function showEndModal(a) {
   showModal(`
@@ -473,12 +818,12 @@ function renderSummary(id) {
       </div>
     </section>
     <section class="card">
-      <h3>At-Bat Replay</h3>
+      <h3>At-Bat Replay – tap to fix a batter</h3>
       ${a.batters.map((b,i)=>`
-        <div class="list-item">
+        <div class="list-item" data-edit-batter="${b.id}">
           <div><strong>${i+1}. Batter #${esc(b.jersey || '—')}</strong><br>
-          <span class="muted">${b.pitches.map(p=>esc(p.result)).join(' · ') || 'No pitches'}</span></div>
-          <span class="badge">${esc(b.outcome || '—')}</span>
+          <span class="muted">${b.pitches.map(p=>esc(pitchLabel(p.result))).join(' · ') || 'No pitches'}</span></div>
+          <span class="badge">${esc(outcomeLabel(b.outcome))}</span>
         </div>`).join('') || `<p class="muted">No completed batters.</p>`}
     </section>
     <section class="card">
@@ -489,6 +834,10 @@ function renderSummary(id) {
   document.getElementById('resumeSummaryBtn')?.addEventListener('click', () => {
     data.activeAppearanceId = a.id; saveData(); navigate('tracker');
   });
+  app.querySelectorAll('[data-edit-batter]').forEach(row => row.addEventListener('click', () => {
+    const batter = a.batters.find(x => x.id === row.dataset.editBatter);
+    if (batter) openOutcomeEditor(a, { existingBatter: batter, onDone: () => renderSummary(id) });
+  }));
 }
 
 function renderSettings() {
