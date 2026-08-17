@@ -4,7 +4,7 @@
   "start_url": "./",
   "display": "standalone",
   "background_color": "#f4f7fa",
-  "theme_color": "#17324d",
+  "theme_color": "#2f78ef",
   "description": "Offline pitcher-focused pitch count and appearance tracker.",
   "icons": [
     {
