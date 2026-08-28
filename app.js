@@ -11,9 +11,31 @@ const defaultData = {
   activeAppearanceId: null,
   settings: {
     enablePitchTypes: false,
-    defaultPitchLimit: 85
+    defaultPitchLimit: 85,
+    inningsPerGame: 7
   }
 };
+
+const PITCH_TYPES = [
+  { code: 'FB', label: 'Fastball', statKey: 'MPHFB' },
+  { code: 'CT', label: 'Cutter', statKey: 'MPHCT' },
+  { code: 'CB', label: 'Curveball', statKey: 'MPHCB' },
+  { code: 'SL2', label: 'Slider', statKey: 'MPHSL' },
+  { code: 'CH', label: 'Changeup', statKey: 'MPHCH' },
+  { code: 'OS', label: 'Offspeed/Other', statKey: 'MPHOS' }
+];
+
+// Backfills fields added after an appearance may have been created/saved, so
+// older saved data keeps working without a migration step.
+function normalizeAppearance(a) {
+  if (!a.tally) a.tally = { pik: 0, bk: 0, cs: 0, sb: 0 };
+  if (typeof a.lob !== 'number') a.lob = 0;
+  if (a.decision === undefined) a.decision = null;
+  if (typeof a.saveOpportunity !== 'boolean') a.saveOpportunity = false;
+  if (typeof a.isStart !== 'boolean') a.isStart = false;
+  if (!a.bases) a.bases = { ...(a.inherited || emptyBases()) };
+  return a;
+}
 
 let data = loadData();
 let route = 'home';
@@ -66,7 +88,7 @@ const SAFE_TYPES = [
   { code: '2B',  label: 'Double', outs: 0 },
   { code: '3B',  label: 'Triple', outs: 0 },
   { code: 'HR',  label: 'Home Run', outs: 0 },
-  { code: 'FC',  label: "Fielder's Choice", outs: 1, needsRunner: true },
+  { code: 'FC',  label: "Fielder's Choice", outs: 1, needsRunner: true, runnerBases: ['second','third'] },
   { code: 'ROE', label: 'Reached on Error', outs: 0 },
   { code: 'CI',  label: "Catcher's Interference", outs: 0 },
   { code: 'DI',  label: 'Defensive Interference', outs: 0 },
@@ -100,6 +122,17 @@ function findOutcomeMeta(code) {
 function outcomeLabel(code) {
   const meta = findOutcomeMeta(code);
   return meta ? meta.label : (code || '—');
+}
+
+// Earned-run heuristic: official scoring reconstructs the half-inning without
+// the error, which needs runner-identity tracking this app doesn't have. As a
+// practical stand-in: a run is unearned if the batter reached on an error
+// (ROE) or an error was logged on this play; otherwise every run charged on
+// this play is earned. Still hand-editable for cases the heuristic misses.
+function computeDefaultEarnedRuns(code, runs, errors) {
+  runs = runs || 0;
+  if (code === 'ROE' || (errors || 0) > 0) return 0;
+  return runs;
 }
 
 /* ---------------------------------------------------------------------- */
@@ -166,6 +199,15 @@ function baseLabel(key) {
   return key === 'first' ? '1st' : key === 'second' ? '2nd' : '3rd';
 }
 
+// Tallies whoever is still on base into LOB and clears the bases — call this
+// whenever a half-inning actually ends (3rd out, or the inning is manually
+// advanced). This also fixes bases not resetting between innings.
+function endHalfInning(a) {
+  const occ = Object.values(a.bases || {}).filter(Boolean).length;
+  a.lob = (a.lob || 0) + occ;
+  a.bases = emptyBases();
+}
+
 /* ---------------------------------------------------------------------- */
 /* Derived stats (always computed from batters, never drift)               */
 /* ---------------------------------------------------------------------- */
@@ -204,6 +246,116 @@ function statsFor(a) {
     earnedRuns: totals.earnedRuns,
     errors: totals.errors
   };
+}
+
+/* ---------------------------------------------------------------------- */
+/* GameChanger-style stat line (Appearances screen + export only)          */
+/* ---------------------------------------------------------------------- */
+
+const GC_STAT_COLUMNS = [
+  ['IP','Innings pitched'], ['GS','Games started'], ['BF','Total batters faced'], ['#P','Total pitches'],
+  ['W','Wins'], ['L','Losses'], ['SV','Saves'], ['SVO','Save opportunities'], ['BS','Blown saves'], ['SV%','Save percentage'],
+  ['H','Hits allowed'], ['R','Runs allowed'], ['ER','Earned runs allowed'], ['BB','Base on balls (walks)'], ['SO','Strikeouts'],
+  ['K-L','Strikeouts looking'], ['HBP','Hit batters'], ['ERA','Earned run average'], ['WHIP','Walks plus hits per innings pitched'],
+  ['LOB','Runners left on base'], ['BK','Balks'], ['PIK','Runners picked off'], ['CS','Runners caught stealing'], ['SB','Stolen bases allowed'],
+  ['SB%','Stolen bases allowed percentage'], ['WP','Wild pitches'], ['BAA','Opponent batting average'],
+  ['MPHFB','Fastball average velocity'], ['MPHCT','Cutter average velocity'], ['MPHCB','Curveball average velocity'],
+  ['MPHSL','Slider average velocity'], ['MPHCH','Changeup average velocity'], ['MPHOS','Offspeed average velocity']
+];
+
+// Builds the full GameChanger-abbreviation stat line for one appearance.
+// Only used on the Summary (Appearances) screen and exports — the live
+// Tracker screen keeps its own simple pitch-count stat grid.
+function gcStatsFor(a) {
+  normalizeAppearance(a);
+  const s = statsFor(a);
+  const totals = computeTotals(a);
+  const pitches = a.batters.flatMap(b => b.pitches || []);
+  const outs = totals.outs;
+  const tally = a.tally || { pik: 0, bk: 0, cs: 0, sb: 0 };
+  const inningsPerGame = data.settings.inningsPerGame || 7;
+
+  const hbp = a.batters.filter(b => b.completed && b.outcome === 'HBP').length;
+  const nonAbCodes = ['BB','IBB','HBP','CI','DI'];
+  const nonAb = a.batters.filter(b => b.completed && nonAbCodes.includes(b.outcome)).length;
+  const ab = Math.max(0, s.batters - nonAb);
+  const wp = pitches.filter(p => p.advance === 'WP').length;
+
+  const era = outs > 0 ? (totals.earnedRuns / outs) * 3 * inningsPerGame : 0;
+  const whip = outs > 0 ? (s.walks + s.hits) / (outs / 3) : 0;
+  const baa = ab > 0 ? (s.hits / ab) : 0;
+
+  const sbAttempts = (tally.sb || 0) + (tally.cs || 0);
+  const sbPct = sbAttempts > 0 ? (tally.sb / sbAttempts * 100) : 0;
+
+  const sv = a.decision === 'SV' ? 1 : 0;
+  const bs = a.decision === 'BS' ? 1 : 0;
+  const svo = a.saveOpportunity ? 1 : 0;
+  const svPct = svo > 0 ? (sv / svo * 100) : 0;
+
+  const velocities = {};
+  for (const pt of PITCH_TYPES) {
+    const vals = pitches.filter(p => p.pitchType === pt.code && typeof p.velocity === 'number' && !isNaN(p.velocity)).map(p => p.velocity);
+    velocities[pt.statKey] = vals.length ? (vals.reduce((x,y) => x+y, 0) / vals.length) : null;
+  }
+
+  return {
+    IP: s.ip, GS: a.isStart ? 1 : 0, BF: s.batters, '#P': s.total,
+    W: a.decision === 'W' ? 1 : 0, L: a.decision === 'L' ? 1 : 0,
+    SV: sv, SVO: svo, BS: bs, 'SV%': svPct,
+    H: s.hits, R: s.runs, ER: s.earnedRuns, BB: s.walks, SO: s.strikeouts,
+    'K-L': s.looking, HBP: hbp, ERA: era, WHIP: whip, LOB: a.lob || 0,
+    BK: tally.bk || 0, PIK: tally.pik || 0, CS: tally.cs || 0, SB: tally.sb || 0, 'SB%': sbPct,
+    WP: wp, BAA: baa,
+    MPHFB: velocities.MPHFB, MPHCT: velocities.MPHCT, MPHCB: velocities.MPHCB,
+    MPHSL: velocities.MPHSL, MPHCH: velocities.MPHCH, MPHOS: velocities.MPHOS
+  };
+}
+
+function formatGcStat(code, val) {
+  if (val === null || val === undefined) return '—';
+  if (code === 'IP') return String(val);
+  if (code === 'ERA' || code === 'WHIP') return Number(val).toFixed(2);
+  if (code === 'BAA') return Number(val).toFixed(3).replace(/^0\./, '.');
+  if (code.endsWith('%')) return Number(val).toFixed(1) + '%';
+  if (code.startsWith('MPH')) return Number(val).toFixed(1);
+  return String(val);
+}
+
+function renderGcStatsTable(a) {
+  const stats = gcStatsFor(a);
+  return `
+    <div class="gc-stats-wrap">
+      <table class="gc-stats">
+        <thead><tr>${GC_STAT_COLUMNS.map(([code]) => `<th>${esc(code)}</th>`).join('')}</tr></thead>
+        <tbody><tr>${GC_STAT_COLUMNS.map(([code]) => `<td>${formatGcStat(code, stats[code])}</td>`).join('')}</tr></tbody>
+      </table>
+    </div>
+    <details style="margin-top:10px">
+      <summary class="muted" style="cursor:pointer">What do these mean?</summary>
+      <p class="muted" style="font-size:.8rem;line-height:1.6">
+        ${GC_STAT_COLUMNS.map(([code,label]) => `<strong>${esc(code)}</strong> ${esc(label)}`).join(' &nbsp;·&nbsp; ')}
+      </p>
+    </details>`;
+}
+
+function gcCsvFor(a) {
+  const p = pitcherById(a.pitcherId);
+  const stats = gcStatsFor(a);
+  const header = ['Pitcher','Date','Team','Opponent', ...GC_STAT_COLUMNS.map(([code]) => code)];
+  const row = [
+    p?.displayName || 'Pitcher', a.date, a.team, a.opponent,
+    ...GC_STAT_COLUMNS.map(([code]) => (stats[code] === null || stats[code] === undefined) ? '' : stats[code])
+  ];
+  const escCsv = v => /[",\n]/.test(String(v)) ? `"${String(v).replace(/"/g,'""')}"` : String(v);
+  return header.map(escCsv).join(',') + '\n' + row.map(escCsv).join(',');
+}
+
+function downloadCsv(filename, csvText) {
+  const blob = new Blob([csvText], { type: 'text/csv' });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a'); link.href = url; link.download = filename; link.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
 function navigate(next) {
@@ -283,7 +435,7 @@ function renderPitchers() {
     <section class="card">
       <h2 class="section-title">Pitchers</h2>
       ${data.pitchers.map(p => `
-        <div class="list-item">
+        <div class="list-item" data-edit-pitcher="${p.id}">
           <div>
             <strong>${esc(p.displayName)}</strong><br>
             <span class="muted">${esc(p.school || '')}${p.gradYear ? ` · Class of ${esc(p.gradYear)}` : ''} · Throws ${esc(p.arm)}</span>
@@ -294,20 +446,7 @@ function renderPitchers() {
     <section class="card">
       <h3>Add Pitcher</h3>
       <form id="pitcherForm">
-        <div class="row">
-          <div><label>First name</label><input name="firstName" required></div>
-          <div><label>Last name</label><input name="lastName" required></div>
-        </div>
-        <label>Display name or nickname</label><input name="displayName" placeholder="Optional">
-        <div class="row">
-          <div><label>Jersey number</label><input name="jersey" inputmode="numeric"></div>
-          <div><label>Throwing arm</label><select name="arm"><option>Right</option><option>Left</option></select></div>
-        </div>
-        <label>Date of birth</label><input type="date" name="dob">
-        <div class="row">
-          <div><label>School</label><input name="school"></div>
-          <div><label>Graduation year</label><input name="gradYear" inputmode="numeric"></div>
-        </div>
+        ${pitcherFormFields()}
         <button class="primary full" type="submit" style="margin-top:14px">Save Pitcher</button>
       </form>
     </section>`;
@@ -324,6 +463,62 @@ function renderPitchers() {
       gradYear:f.get('gradYear').trim(), createdAt:Date.now()
     });
     saveData(); renderPitchers();
+  });
+  app.querySelectorAll('[data-edit-pitcher]').forEach(row => row.addEventListener('click', () => {
+    const pitcher = pitcherById(row.dataset.editPitcher);
+    if (pitcher) openPitcherEditor(pitcher);
+  }));
+}
+
+function pitcherFormFields(p) {
+  const v = p || {};
+  return `
+    <div class="row">
+      <div><label>First name</label><input name="firstName" value="${esc(v.firstName||'')}" required></div>
+      <div><label>Last name</label><input name="lastName" value="${esc(v.lastName||'')}" required></div>
+    </div>
+    <label>Display name or nickname</label><input name="displayName" placeholder="Optional" value="${esc(v.displayName||'')}">
+    <div class="row">
+      <div><label>Jersey number</label><input name="jersey" inputmode="numeric" value="${esc(v.jersey||'')}"></div>
+      <div><label>Throwing arm</label><select name="arm">
+        <option ${v.arm==='Right'||!v.arm?'selected':''}>Right</option>
+        <option ${v.arm==='Left'?'selected':''}>Left</option>
+      </select></div>
+    </div>
+    <label>Date of birth</label><input type="date" name="dob" value="${esc(v.dob||'')}">
+    <div class="row">
+      <div><label>School</label><input name="school" value="${esc(v.school||'')}"></div>
+      <div><label>Graduation year</label><input name="gradYear" inputmode="numeric" value="${esc(v.gradYear||'')}"></div>
+    </div>`;
+}
+
+function openPitcherEditor(pitcher) {
+  showModal(`
+    <h3>Edit Pitcher</h3>
+    <form id="editPitcherForm">
+      ${pitcherFormFields(pitcher)}
+      <button class="primary full" type="submit" style="margin-top:14px">Save Changes</button>
+      <button class="secondary full" type="button" id="cancelEditPitcher" style="margin-top:10px">Cancel</button>
+    </form>
+  `, backdrop => {
+    backdrop.querySelector('#editPitcherForm').addEventListener('submit', e => {
+      e.preventDefault();
+      const f = new FormData(e.target);
+      const first = f.get('firstName').trim();
+      const last = f.get('lastName').trim();
+      pitcher.firstName = first;
+      pitcher.lastName = last;
+      pitcher.displayName = f.get('displayName').trim() || `${first} ${last}`;
+      pitcher.jersey = f.get('jersey').trim();
+      pitcher.arm = f.get('arm');
+      pitcher.dob = f.get('dob');
+      pitcher.school = f.get('school').trim();
+      pitcher.gradYear = f.get('gradYear').trim();
+      saveData();
+      closeModal(backdrop);
+      renderPitchers();
+    });
+    backdrop.querySelector('#cancelEditPitcher').addEventListener('click', () => closeModal(backdrop));
   });
 }
 
@@ -355,10 +550,24 @@ function renderNewAppearance() {
           <label><input type="checkbox" name="r2"> Second</label>
           <label><input type="checkbox" name="r3"> Third</label>
         </div>
+        <label style="margin-top:10px"><input type="checkbox" name="isStart" id="isStartChk"> Game start (GS)</label>
         <button class="primary full" style="margin-top:14px">Start Tracking</button>
       </form>
     </section>`;
-  document.getElementById('appearanceForm').addEventListener('submit', e => {
+  const form = document.getElementById('appearanceForm');
+  let gsManual = false;
+  function recomputeGS() {
+    if (gsManual) return;
+    const f = new FormData(form);
+    const isTop1NoOuts = Number(f.get('inning')) === 1 && f.get('half') === 'Top' && Number(f.get('outs')) === 0;
+    const noInherited = !f.get('r1') && !f.get('r2') && !f.get('r3');
+    document.getElementById('isStartChk').checked = isTop1NoOuts && noInherited;
+  }
+  form.querySelectorAll('[name="inning"],[name="half"],[name="outs"],[name="r1"],[name="r2"],[name="r3"]')
+    .forEach(el => el.addEventListener('input', recomputeGS));
+  document.getElementById('isStartChk').addEventListener('change', () => { gsManual = true; });
+  recomputeGS();
+  form.addEventListener('submit', e => {
     e.preventDefault();
     const f = new FormData(e.target);
     const inherited = { first: !!f.get('r1'), second: !!f.get('r2'), third: !!f.get('r3') };
@@ -370,6 +579,8 @@ function renderNewAppearance() {
       entryOuts:Number(f.get('outs')), currentOuts:Number(f.get('outs')),
       pitchLimit:Number(f.get('pitchLimit')) || null,
       inherited, bases: { ...inherited },
+      isStart: !!f.get('isStart'), decision: null, saveOpportunity: false,
+      tally: { pik: 0, bk: 0, cs: 0, sb: 0 }, lob: 0,
       batters:[], currentBatter:null, createdAt:Date.now(), endedAt:null, endReason:''
     };
     data.appearances.push(a);
@@ -409,7 +620,7 @@ function pitchLabel(code) {
 function renderTracker() {
   const a = activeAppearance();
   if (!a) return navigate('home');
-  if (!a.bases) a.bases = { ...(a.inherited || emptyBases()) };
+  normalizeAppearance(a);
   if (!a.currentBatter) startNextBatter(a);
   const b = a.currentBatter;
   const s = statsFor(a);
@@ -441,6 +652,7 @@ function renderTracker() {
         <button class="pitch-btn foul" data-pitch="F">Foul</button>
         <button class="pitch-btn" data-pitch="DK">Drop K</button>
       </div>
+      ${renderPitchTypeWidget(a)}
       <div class="grid two" style="margin-top:10px">
         <button class="wp-btn" id="wildPitchBtn" ${!b.pitches.length ? 'disabled' : ''}>Wild Pitch</button>
         <button class="wp-btn" id="passedBallBtn" ${!b.pitches.length ? 'disabled' : ''}>Passed Ball</button>
@@ -461,6 +673,8 @@ function renderTracker() {
         <div class="stat"><strong>${s.ip}</strong><span>IP</span></div>
       </div>
     </section>
+
+    ${renderTallyWidget(a)}
 
     <section class="card">
       <div class="grid two">
@@ -486,9 +700,17 @@ function renderTracker() {
     saveData();
   });
   app.querySelectorAll('[data-pitch]').forEach(btn => btn.addEventListener('click', () => {
-    b.pitches.push({ id:uid('pitch'), result:btn.dataset.pitch, at:Date.now(), pitchType:null, velocity:null, advance:null });
+    const tagged = data.settings.enablePitchTypes;
+    b.pitches.push({
+      id:uid('pitch'), result:btn.dataset.pitch, at:Date.now(),
+      pitchType: tagged ? (a.pendingPitchType || 'FB') : null,
+      velocity: tagged && a.pendingVelocity ? Number(a.pendingVelocity) : null,
+      advance:null
+    });
     saveData(); renderTracker();
   }));
+  wirePitchTypeWidget(app, a, renderTracker);
+  wireTallyWidget(app, a, renderTracker);
   document.getElementById('wildPitchBtn')?.addEventListener('click', () => {
     if (!b.pitches.length) return;
     b.pitches[b.pitches.length-1].advance = 'WP';
@@ -506,6 +728,7 @@ function renderTracker() {
   });
   document.getElementById('outcomeBtn').addEventListener('click', () => openOutcomeEditor(a, { onDone: () => renderTracker() }));
   document.getElementById('advanceInningBtn').addEventListener('click', () => {
+    endHalfInning(a);
     a.inning += 1; a.currentOuts = 0; saveData(); renderTracker();
   });
   document.getElementById('endAppearanceBtn').addEventListener('click', () => showEndModal(a));
@@ -533,6 +756,69 @@ function renderBasesWidget(a) {
     </section>`;
 }
 
+const TALLY_FIELDS = [
+  { key: 'pik', label: 'Pickoffs (PIK)' },
+  { key: 'bk', label: 'Balks (BK)' },
+  { key: 'cs', label: 'Caught Stealing (CS)' },
+  { key: 'sb', label: 'Stolen Bases (SB)' }
+];
+
+function renderTallyWidget(a) {
+  const t = a.tally || { pik: 0, bk: 0, cs: 0, sb: 0 };
+  return `
+    <section class="card">
+      <div class="kicker">Live Tallies</div>
+      <div class="grid two" style="margin-top:8px">
+        ${TALLY_FIELDS.map(f => `
+          <div class="tally-row">
+            <span>${f.label}</span>
+            <div class="tally-controls">
+              <button class="secondary small" type="button" data-tally-dec="${f.key}">−</button>
+              <strong>${t[f.key] || 0}</strong>
+              <button class="secondary small" type="button" data-tally-inc="${f.key}">+</button>
+            </div>
+          </div>`).join('')}
+      </div>
+    </section>`;
+}
+
+function wireTallyWidget(root, a, rerender) {
+  if (!a.tally) a.tally = { pik: 0, bk: 0, cs: 0, sb: 0 };
+  root.querySelectorAll('[data-tally-inc]').forEach(btn => btn.addEventListener('click', () => {
+    const key = btn.dataset.tallyInc;
+    a.tally[key] = (a.tally[key] || 0) + 1;
+    saveData(); rerender();
+  }));
+  root.querySelectorAll('[data-tally-dec]').forEach(btn => btn.addEventListener('click', () => {
+    const key = btn.dataset.tallyDec;
+    a.tally[key] = Math.max(0, (a.tally[key] || 0) - 1);
+    saveData(); rerender();
+  }));
+}
+
+function renderPitchTypeWidget(a) {
+  if (!data.settings.enablePitchTypes) return '';
+  const selected = a.pendingPitchType || 'FB';
+  return `
+    <div class="pitch-type-row">
+      <span class="muted" style="font-size:.78rem">Tag next pitch:</span>
+      ${PITCH_TYPES.map(pt => `<button type="button" class="pitch-type-chip ${pt.code===selected?'on':''}" data-pitch-type="${pt.code}">${pt.label}</button>`).join('')}
+      <input type="number" id="pendingVelocity" placeholder="MPH" value="${a.pendingVelocity || ''}" inputmode="numeric">
+    </div>`;
+}
+
+function wirePitchTypeWidget(root, a, rerender) {
+  if (!data.settings.enablePitchTypes) return;
+  root.querySelectorAll('[data-pitch-type]').forEach(btn => btn.addEventListener('click', () => {
+    a.pendingPitchType = btn.dataset.pitchType;
+    saveData(); rerender();
+  }));
+  root.querySelector('#pendingVelocity')?.addEventListener('input', e => {
+    a.pendingVelocity = e.target.value;
+    saveData();
+  });
+}
+
 /* ---------------------------------------------------------------------- */
 /* Outcome editor (used for recording AND editing a batter)                */
 /* ---------------------------------------------------------------------- */
@@ -549,6 +835,10 @@ function openOutcomeEditor(a, { existingBatter, onDone }) {
     runs: isEdit ? target.runs : 0,
     earnedRuns: isEdit ? target.earnedRuns : 0,
     errors: isEdit ? target.errors : 0,
+    // Tracks whether the user has typed directly into the Earned Runs field this
+    // session — until then, it live-recomputes from Runs Scored/Errors so opening
+    // an edit still shows whatever was already saved (see detail-stage render).
+    earnedRunsManual: false,
     pitches: isEdit ? [...(target.pitches || [])] : null
   };
 
@@ -560,6 +850,15 @@ function openOutcomeEditor(a, { existingBatter, onDone }) {
 
   function occupiedBases() {
     return Object.keys(a.bases || {}).filter(k => a.bases[k]);
+  }
+
+  // FC is restricted to the lead runner (2nd/3rd) per user convention; FORCE/TAG/DP
+  // keep the full occupied-base list. See findOutcomeMeta().runnerBases.
+  function eligibleRunnerBases(code) {
+    const meta = findOutcomeMeta(code);
+    const allowed = meta && meta.runnerBases;
+    const occ = occupiedBases();
+    return allowed ? occ.filter(k => allowed.includes(k)) : occ;
   }
 
   function renderStage() {
@@ -578,10 +877,9 @@ function openOutcomeEditor(a, { existingBatter, onDone }) {
     }
 
     if (state.stage === 'type') {
-      const occ = occupiedBases();
       const list = state.category === 'safe' ? SAFE_TYPES : OUT_TYPES;
       const visible = list.filter(o => {
-        if (['FC','FORCE','TAG','DP','TP'].includes(o.code)) return occ.length > 0;
+        if (['FC','FORCE','TAG','DP','TP'].includes(o.code)) return eligibleRunnerBases(o.code).length > 0;
         return true;
       });
       content.innerHTML = `
@@ -623,9 +921,10 @@ function openOutcomeEditor(a, { existingBatter, onDone }) {
     }
 
     if (state.stage === 'runner') {
-      const occ = occupiedBases();
+      const occ = eligibleRunnerBases(state.code);
       content.innerHTML = `
         <h3>Which runner was put out?</h3>
+        ${state.code === 'FC' ? '<p class="muted">Fielder\'s Choice targets the lead runner — batter reaches base.</p>' : ''}
         <div class="grid three">
           ${occ.map(k => `<button class="outcome-btn" data-runner="${k}">Runner on ${baseLabel(k)}</button>`).join('')}
         </div>
@@ -660,7 +959,11 @@ function openOutcomeEditor(a, { existingBatter, onDone }) {
           <div><label>Runs scored</label><input id="runsScored" type="number" min="0" value="${state.runs||0}"></div>
         </div>
         <div class="row">
-          <div><label>Earned runs</label><input id="earnedRuns" type="number" min="0" value="${state.earnedRuns||0}"></div>
+          <div>
+            <label>Earned runs</label>
+            <input id="earnedRuns" type="number" min="0" value="${state.earnedRuns||0}">
+            <span class="muted" id="erHint" style="font-size:12px">${state.earnedRunsManual ? 'Edited manually · ' : 'Auto from outcome/errors · '}<a href="#" id="erAutoReset">${state.earnedRunsManual ? 'reset to auto' : ''}</a></span>
+          </div>
           <div><label>Errors</label><input id="errors" type="number" min="0" value="${state.errors||0}"></div>
         </div>
         <button class="primary full" id="saveOutcome" style="margin-top:12px">${isEdit ? 'Save Changes' : 'Save and Next Batter'}</button>
@@ -678,6 +981,30 @@ function openOutcomeEditor(a, { existingBatter, onDone }) {
           renderStage();
         }));
       }
+      function refreshAutoEarnedRuns() {
+        if (state.earnedRunsManual) return;
+        const runs = Number(content.querySelector('#runsScored').value) || 0;
+        const errors = Number(content.querySelector('#errors').value) || 0;
+        content.querySelector('#earnedRuns').value = computeDefaultEarnedRuns(state.code, runs, errors);
+      }
+      content.querySelector('#runsScored').addEventListener('input', refreshAutoEarnedRuns);
+      content.querySelector('#errors').addEventListener('input', refreshAutoEarnedRuns);
+      content.querySelector('#earnedRuns').addEventListener('input', () => {
+        state.earnedRunsManual = true;
+        content.querySelector('#erHint').innerHTML = 'Edited manually · <a href="#" id="erAutoReset">reset to auto</a>';
+        content.querySelector('#erAutoReset').addEventListener('click', ev => {
+          ev.preventDefault();
+          state.earnedRunsManual = false;
+          refreshAutoEarnedRuns();
+          content.querySelector('#erHint').innerHTML = 'Auto from outcome/errors · <a href="#" id="erAutoReset"></a>';
+        });
+      });
+      content.querySelector('#erAutoReset')?.addEventListener('click', ev => {
+        ev.preventDefault();
+        state.earnedRunsManual = false;
+        refreshAutoEarnedRuns();
+        content.querySelector('#erHint').innerHTML = 'Auto from outcome/errors · <a href="#" id="erAutoReset"></a>';
+      });
       content.querySelector('#saveOutcome').addEventListener('click', () => {
         state.outs = Number(content.querySelector('#outsRecorded').value);
         state.runs = Number(content.querySelector('#runsScored').value) || 0;
@@ -722,6 +1049,7 @@ function openOutcomeEditor(a, { existingBatter, onDone }) {
       a.currentOuts += b.outsRecorded;
       a.bases = applyAdvancement(a.bases, b.outcome, b.runnerOutBase);
       a.batters.push(b);
+      if (a.currentOuts >= 3) endHalfInning(a);
       while (a.currentOuts >= 3) { a.currentOuts -= 3; a.inning += 1; }
       startNextBatter(a);
     }
@@ -743,6 +1071,36 @@ function showModal(html, bind) {
 }
 function closeModal(backdrop) { backdrop.remove(); }
 
+const DECISION_OPTIONS = [
+  { value: '', label: 'None' },
+  { value: 'W', label: 'Win' },
+  { value: 'L', label: 'Loss' },
+  { value: 'SV', label: 'Save' },
+  { value: 'HOLD', label: 'Hold' },
+  { value: 'BS', label: 'Blown Save' }
+];
+
+function decisionFieldsHtml(a) {
+  return `
+    <label>Game decision</label>
+    <select id="decisionSelect">
+      ${DECISION_OPTIONS.map(o => `<option value="${o.value}" ${((a.decision||'')===o.value)?'selected':''}>${o.label}</option>`).join('')}
+    </select>
+    <label><input type="checkbox" id="saveOppChk" ${a.saveOpportunity?'checked':''}> Entered in a save opportunity (SVO)</label>`;
+}
+
+function wireDecisionFields(root, a, rerender) {
+  root.querySelector('#decisionSelect')?.addEventListener('change', e => {
+    a.decision = e.target.value || null;
+    if (a.decision === 'SV' || a.decision === 'BS') a.saveOpportunity = true;
+    saveData(); rerender();
+  });
+  root.querySelector('#saveOppChk')?.addEventListener('change', e => {
+    a.saveOpportunity = e.target.checked;
+    saveData(); rerender();
+  });
+}
+
 function showEndModal(a) {
   showModal(`
     <h3>End Pitching Appearance</h3>
@@ -759,12 +1117,18 @@ function showEndModal(a) {
       <option>Other</option>
     </select>
     <label>Notes</label><textarea id="endNotes"></textarea>
+    ${decisionFieldsHtml(a)}
     <button class="danger full" id="confirmEnd" style="margin-top:12px">End and Save</button>
     <button class="secondary full" id="cancelEnd" style="margin-top:10px">Cancel</button>
   `, backdrop => {
+    backdrop.querySelector('#decisionSelect').addEventListener('change', e => {
+      if (e.target.value === 'SV' || e.target.value === 'BS') backdrop.querySelector('#saveOppChk').checked = true;
+    });
     backdrop.querySelector('#confirmEnd').addEventListener('click', () => {
       a.endReason = backdrop.querySelector('#endReason').value;
       a.notes = backdrop.querySelector('#endNotes').value.trim();
+      a.decision = backdrop.querySelector('#decisionSelect').value || null;
+      a.saveOpportunity = backdrop.querySelector('#saveOppChk').checked;
       a.endedAt = Date.now();
       data.activeAppearanceId = null;
       saveData(); closeModal(backdrop); navigate(`summary:${a.id}`);
@@ -796,6 +1160,7 @@ function renderAppearances() {
 function renderSummary(id) {
   const a = data.appearances.find(x=>x.id===id);
   if (!a) return navigate('appearances');
+  normalizeAppearance(a);
   const p = pitcherById(a.pitcherId), s = statsFor(a);
   app.innerHTML = `
     <section class="card hero">
@@ -818,6 +1183,15 @@ function renderSummary(id) {
       </div>
     </section>
     <section class="card">
+      <h3 class="section-title">Full Stat Line (GameChanger style)</h3>
+      ${renderGcStatsTable(a)}
+    </section>
+    <section class="card">
+      <h3 class="section-title">Decision &amp; Situational</h3>
+      ${decisionFieldsHtml(a)}
+    </section>
+    ${renderTallyWidget(a)}
+    <section class="card">
       <h3>At-Bat Replay – tap to fix a batter</h3>
       ${a.batters.map((b,i)=>`
         <div class="list-item" data-edit-batter="${b.id}">
@@ -827,13 +1201,17 @@ function renderSummary(id) {
         </div>`).join('') || `<p class="muted">No completed batters.</p>`}
     </section>
     <section class="card">
-      <button class="secondary full" id="exportOneBtn">Export This Appearance</button>
+      <button class="secondary full" id="exportOneBtn">Export This Appearance (JSON)</button>
+      <button class="secondary full" id="exportGcBtn" style="margin-top:10px">Export Stat Line (CSV)</button>
       ${!a.endedAt ? `<button class="success full" id="resumeSummaryBtn" style="margin-top:10px">Resume Tracking</button>` : ''}
     </section>`;
   document.getElementById('exportOneBtn').addEventListener('click', () => downloadJson(`vip-appearance-${a.date}.json`, a));
+  document.getElementById('exportGcBtn').addEventListener('click', () => downloadCsv(`vip-stat-line-${a.date}.csv`, gcCsvFor(a)));
   document.getElementById('resumeSummaryBtn')?.addEventListener('click', () => {
     data.activeAppearanceId = a.id; saveData(); navigate('tracker');
   });
+  wireDecisionFields(app, a, () => renderSummary(id));
+  wireTallyWidget(app, a, () => renderSummary(id));
   app.querySelectorAll('[data-edit-batter]').forEach(row => row.addEventListener('click', () => {
     const batter = a.batters.find(x => x.id === row.dataset.editBatter);
     if (batter) openOutcomeEditor(a, { existingBatter: batter, onDone: () => renderSummary(id) });
@@ -847,7 +1225,9 @@ function renderSettings() {
       <form id="settingsForm">
         <label>Default pitch limit</label>
         <input type="number" name="defaultPitchLimit" min="1" value="${data.settings.defaultPitchLimit || 85}">
-        <label><input type="checkbox" name="enablePitchTypes" ${data.settings.enablePitchTypes?'checked':''}> Enable pitch types for future tracking</label>
+        <label>Innings per regulation game (for ERA)</label>
+        <input type="number" name="inningsPerGame" min="1" value="${data.settings.inningsPerGame || 7}">
+        <label><input type="checkbox" name="enablePitchTypes" ${data.settings.enablePitchTypes?'checked':''}> Tag pitch type &amp; velocity for each pitch (fastball/curveball/etc.)</label>
         <button class="primary full" style="margin-top:12px">Save Settings</button>
       </form>
     </section>
@@ -862,6 +1242,7 @@ function renderSettings() {
   document.getElementById('settingsForm').addEventListener('submit', e => {
     e.preventDefault(); const f = new FormData(e.target);
     data.settings.defaultPitchLimit = Number(f.get('defaultPitchLimit')) || 85;
+    data.settings.inningsPerGame = Number(f.get('inningsPerGame')) || 7;
     data.settings.enablePitchTypes = !!f.get('enablePitchTypes');
     saveData(); alert('Settings saved.');
   });

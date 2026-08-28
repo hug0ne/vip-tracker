@@ -129,3 +129,23 @@ textarea { min-height:88px; resize:vertical; }
   .grid.five { grid-template-columns:repeat(3,1fr); }
   .stat-grid { grid-template-columns:repeat(2,1fr); }
 }
+.tally-row {
+  display:flex; justify-content:space-between; align-items:center;
+  background:#eef3f7; border-radius:12px; padding:10px 12px; font-weight:700; font-size:.85rem;
+}
+.tally-controls { display:flex; align-items:center; gap:8px; }
+.tally-controls button.small {
+  min-height:0; padding:4px 10px; font-size:1rem; border-radius:8px;
+}
+.tally-controls strong { min-width:1.4em; text-align:center; }
+.pitch-type-row { display:flex; flex-wrap:wrap; gap:6px; align-items:center; margin-top:8px; }
+.pitch-type-chip {
+  background:#e8eef4; color:var(--brand); border-radius:999px; padding:6px 12px; font-weight:700; font-size:.8rem;
+}
+.pitch-type-chip.on { background:var(--brand); color:white; }
+.pitch-type-row input[type="number"] { width:80px; padding:6px 8px; }
+.gc-stats-wrap { overflow-x:auto; margin-top:8px; }
+table.gc-stats { border-collapse:collapse; width:100%; min-width:560px; font-size:.82rem; }
+table.gc-stats th, table.gc-stats td { border:1px solid var(--line); padding:6px 8px; text-align:center; }
+table.gc-stats th { background:#eef3f7; color:var(--muted); font-size:.7rem; text-transform:uppercase; letter-spacing:.04em; }
+table.gc-stats td { font-weight:700; }
