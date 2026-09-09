@@ -1,5 +1,5 @@
 
-const CACHE = 'vip-tracker-v3';
+const CACHE = 'vip-tracker-v4';
 const ASSETS = ['./','index.html','styles.css','app.js','manifest.webmanifest','icon-192.png','icon-512.png'];
 
 self.addEventListener('install', event => {

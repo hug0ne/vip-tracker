@@ -28,12 +28,16 @@ const PITCH_TYPES = [
 // Backfills fields added after an appearance may have been created/saved, so
 // older saved data keeps working without a migration step.
 function normalizeAppearance(a) {
-  if (!a.tally) a.tally = { pik: 0, bk: 0, cs: 0, sb: 0 };
+  if (!a.tally) a.tally = { pik: 0, bk: 0, cs: 0, sb: 0, pikAttempts: 0 };
+  if (typeof a.tally.pikAttempts !== 'number') a.tally.pikAttempts = 0;
   if (typeof a.lob !== 'number') a.lob = 0;
   if (a.decision === undefined) a.decision = null;
   if (typeof a.saveOpportunity !== 'boolean') a.saveOpportunity = false;
   if (typeof a.isStart !== 'boolean') a.isStart = false;
   if (!a.bases) a.bases = { ...(a.inherited || emptyBases()) };
+  if (typeof a.runsFor !== 'number') a.runsFor = 0;
+  if (typeof a.runsAgainst !== 'number') a.runsAgainst = 0;
+  if (typeof a.runsAgainstManual !== 'boolean') a.runsAgainstManual = false;
   return a;
 }
 
@@ -580,7 +584,8 @@ function renderNewAppearance() {
       pitchLimit:Number(f.get('pitchLimit')) || null,
       inherited, bases: { ...inherited },
       isStart: !!f.get('isStart'), decision: null, saveOpportunity: false,
-      tally: { pik: 0, bk: 0, cs: 0, sb: 0 }, lob: 0,
+      tally: { pik: 0, bk: 0, cs: 0, sb: 0, pikAttempts: 0 }, lob: 0,
+      runsFor: 0, runsAgainst: 0, runsAgainstManual: false,
       batters:[], currentBatter:null, createdAt:Date.now(), endedAt:null, endReason:''
     };
     data.appearances.push(a);
@@ -624,16 +629,18 @@ function renderTracker() {
   if (!a.currentBatter) startNextBatter(a);
   const b = a.currentBatter;
   const s = statsFor(a);
+  const livePitchCount = s.total + (b.pitches ? b.pitches.length : 0);
   const c = currentCount(b);
-  const nearLimit = a.pitchLimit && s.total >= a.pitchLimit - 5;
+  const nearLimit = a.pitchLimit && livePitchCount >= a.pitchLimit - 5;
   const completedBatters = [...a.batters].reverse();
   app.innerHTML = `
-    ${nearLimit ? `<div class="alert">Pitch count is ${s.total}. Limit: ${a.pitchLimit}.</div>` : ''}
+    ${nearLimit ? `<div class="alert">Pitch count is ${livePitchCount}. Limit: ${a.pitchLimit}.</div>` : ''}
     <section class="card">
       <div class="batter-head">
         <div>
-          <div class="kicker">${esc(a.half)} ${a.inning} · ${a.currentOuts} out${a.currentOuts===1?'':'s'}</div>
+          <div class="kicker">${esc(a.half)} ${a.inning} · ${a.currentOuts} out${a.currentOuts===1?'':'s'} · Pitch #${livePitchCount}</div>
           <h2 style="margin:4px 0">Batter #<span id="batterNumberLabel">${esc(b.jersey || '—')}</span></h2>
+          <div class="muted" style="font-size:.8rem">Facing batter ${b.order} of the game · ${s.batters} completed so far</div>
         </div>
         <div class="big-count">${c.balls}-${c.strikes}</div>
       </div>
@@ -641,6 +648,8 @@ function renderTracker() {
       <input id="batterJersey" inputmode="numeric" value="${esc(b.jersey)}" placeholder="Enter jersey number">
       <div class="sequence">${b.pitches.map(p=>`<span>${esc(pitchLabel(p.result))}${p.advance ? ` · ${p.advance}` : ''}</span>`).join('')}</div>
     </section>
+
+    ${renderRunsWidget(a)}
 
     ${renderBasesWidget(a)}
 
@@ -657,6 +666,10 @@ function renderTracker() {
         <button class="wp-btn" id="wildPitchBtn" ${!b.pitches.length ? 'disabled' : ''}>Wild Pitch</button>
         <button class="wp-btn" id="passedBallBtn" ${!b.pitches.length ? 'disabled' : ''}>Passed Ball</button>
       </div>
+      <div class="grid two" style="margin-top:10px">
+        <button class="wp-btn" id="pickedOffBtn" ${!hasOccupiedBase(a) ? 'disabled' : ''}>Picked Off (${(a.tally&&a.tally.pik)||0})</button>
+        <button class="wp-btn" id="caughtStealingBtn" ${!hasOccupiedBase(a) ? 'disabled' : ''}>Caught Stealing (${(a.tally&&a.tally.cs)||0})</button>
+      </div>
       <div class="grid two" style="margin-top:12px">
         <button class="undo" id="undoBtn">Undo Last Pitch</button>
         <button class="primary" id="outcomeBtn">Record Outcome</button>
@@ -665,7 +678,7 @@ function renderTracker() {
 
     <section class="card">
       <div class="stat-grid">
-        <div class="stat"><strong>${s.total}</strong><span>Pitches</span></div>
+        <div class="stat"><strong>${livePitchCount}</strong><span>Pitches</span></div>
         <div class="stat"><strong>${s.strikes}</strong><span>Strikes</span></div>
         <div class="stat"><strong>${s.balls}</strong><span>Balls</span></div>
         <div class="stat"><strong>${s.strikePct.toFixed(0)}%</strong><span>Strike %</span></div>
@@ -723,6 +736,13 @@ function renderTracker() {
     a.bases = advanceOnMissedPitch(a.bases);
     saveData(); renderTracker();
   });
+  document.getElementById('pickedOffBtn')?.addEventListener('click', () => {
+    openRunnerOutQuickAction(a, { title: 'Picked Off — which runner?', tallyKeys: ['pik', 'pikAttempts'], rerender: renderTracker });
+  });
+  document.getElementById('caughtStealingBtn')?.addEventListener('click', () => {
+    openRunnerOutQuickAction(a, { title: 'Caught Stealing — which runner?', tallyKeys: ['cs'], rerender: renderTracker });
+  });
+  wireRunsWidget(app, a, renderTracker);
   document.getElementById('undoBtn').addEventListener('click', () => {
     b.pitches.pop(); saveData(); renderTracker();
   });
@@ -756,15 +776,110 @@ function renderBasesWidget(a) {
     </section>`;
 }
 
+function hasOccupiedBase(a) {
+  return Object.values(a.bases || {}).some(Boolean);
+}
+
+// Picked Off / Caught Stealing are real outs on a specific runner, mid at-bat.
+// Unlike Record Outcome, they never end the current batter's plate appearance —
+// if this happens to be the 3rd out, the half-inning ends but the SAME batter
+// (whose count/pitches so far stay intact) leads off next inning, per user's
+// explicit rule: the batter didn't do anything to end their own turn.
+function openRunnerOutQuickAction(a, { title, tallyKeys, rerender }) {
+  const occ = Object.keys(a.bases || {}).filter(k => a.bases[k]);
+  if (!occ.length) return;
+  showModal(`
+    <h3>${esc(title)}</h3>
+    <div class="grid three">
+      ${occ.map(k => `<button class="outcome-btn" data-runner="${k}">Runner on ${baseLabel(k)}</button>`).join('')}
+    </div>
+    <button class="secondary full" id="cancelModal" style="margin-top:12px">Cancel</button>
+  `, backdrop => {
+    backdrop.querySelectorAll('[data-runner]').forEach(btn => btn.addEventListener('click', () => {
+      applyRunnerOut(a, btn.dataset.runner, tallyKeys);
+      closeModal(backdrop);
+      rerender();
+    }));
+    backdrop.querySelector('#cancelModal').addEventListener('click', () => closeModal(backdrop));
+  });
+}
+
+function applyRunnerOut(a, base, tallyKeys) {
+  if (!a.tally) a.tally = { pik: 0, bk: 0, cs: 0, sb: 0, pikAttempts: 0 };
+  a.bases[base] = false;
+  tallyKeys.forEach(k => { a.tally[k] = (a.tally[k] || 0) + 1; });
+  a.currentOuts = (a.currentOuts || 0) + 1;
+  if (a.currentOuts >= 3) {
+    endHalfInning(a);
+    while (a.currentOuts >= 3) { a.currentOuts -= 3; a.inning += 1; }
+    // Deliberately no startNextBatter() call here — the batter who was up
+    // carries over and leads off next inning, per user's explicit rule.
+  }
+  saveData();
+}
+
+// Runs For is a plain manual tally. Runs Against defaults to this pitcher's
+// own runs-allowed total (kept in sync automatically) but can be overridden —
+// useful when other pitchers also allowed runs in the same game — after which
+// it stops auto-syncing until "resync" is tapped, same pattern as earned runs.
+function renderRunsWidget(a) {
+  const s = statsFor(a);
+  if (!a.runsAgainstManual) a.runsAgainst = s.runs;
+  return `
+    <section class="card">
+      <div class="kicker">Score</div>
+      <div class="grid two" style="margin-top:8px">
+        <div class="tally-row">
+          <span>Runs For</span>
+          <div class="tally-controls">
+            <button class="secondary small" type="button" data-runs-dec="for">−</button>
+            <strong>${a.runsFor || 0}</strong>
+            <button class="secondary small" type="button" data-runs-inc="for">+</button>
+          </div>
+        </div>
+        <div class="tally-row">
+          <span>Runs Against${a.runsAgainstManual ? '' : ' (auto)'}</span>
+          <div class="tally-controls">
+            <button class="secondary small" type="button" data-runs-dec="against">−</button>
+            <strong>${a.runsAgainst || 0}</strong>
+            <button class="secondary small" type="button" data-runs-inc="against">+</button>
+          </div>
+        </div>
+      </div>
+      ${a.runsAgainstManual ? `<button class="secondary full" type="button" id="resyncRunsAgainst" style="margin-top:8px">Resync to pitcher's runs allowed (${s.runs})</button>` : ''}
+    </section>`;
+}
+
+function wireRunsWidget(root, a, rerender) {
+  root.querySelector('[data-runs-inc="for"]')?.addEventListener('click', () => {
+    a.runsFor = (a.runsFor || 0) + 1; saveData(); rerender();
+  });
+  root.querySelector('[data-runs-dec="for"]')?.addEventListener('click', () => {
+    a.runsFor = Math.max(0, (a.runsFor || 0) - 1); saveData(); rerender();
+  });
+  root.querySelector('[data-runs-inc="against"]')?.addEventListener('click', () => {
+    a.runsAgainstManual = true; a.runsAgainst = (a.runsAgainst || 0) + 1; saveData(); rerender();
+  });
+  root.querySelector('[data-runs-dec="against"]')?.addEventListener('click', () => {
+    a.runsAgainstManual = true; a.runsAgainst = Math.max(0, (a.runsAgainst || 0) - 1); saveData(); rerender();
+  });
+  root.querySelector('#resyncRunsAgainst')?.addEventListener('click', () => {
+    a.runsAgainstManual = false; saveData(); rerender();
+  });
+}
+
+// PIK and CS are intentionally NOT plain steppers — they're tied to an actual
+// runner + out (see openRunnerOutQuickAction below) so the count always matches
+// what happened to the bases/outs. BK, SB, and pickoff attempts have no such
+// side effects, so a plain tally still fits them.
 const TALLY_FIELDS = [
-  { key: 'pik', label: 'Pickoffs (PIK)' },
   { key: 'bk', label: 'Balks (BK)' },
-  { key: 'cs', label: 'Caught Stealing (CS)' },
-  { key: 'sb', label: 'Stolen Bases (SB)' }
+  { key: 'sb', label: 'Stolen Bases (SB)' },
+  { key: 'pikAttempts', label: 'Pickoff Attempts' }
 ];
 
 function renderTallyWidget(a) {
-  const t = a.tally || { pik: 0, bk: 0, cs: 0, sb: 0 };
+  const t = a.tally || { pik: 0, bk: 0, cs: 0, sb: 0, pikAttempts: 0 };
   return `
     <section class="card">
       <div class="kicker">Live Tallies</div>
@@ -778,12 +893,21 @@ function renderTallyWidget(a) {
               <button class="secondary small" type="button" data-tally-inc="${f.key}">+</button>
             </div>
           </div>`).join('')}
+        <div class="tally-row">
+          <span>Picked Off (PIK)</span>
+          <div class="tally-controls"><strong>${t.pik || 0}</strong></div>
+        </div>
+        <div class="tally-row">
+          <span>Caught Stealing (CS)</span>
+          <div class="tally-controls"><strong>${t.cs || 0}</strong></div>
+        </div>
       </div>
+      <p class="muted" style="font-size:.78rem;margin-top:8px">PIK and CS are logged as outs via the Picked Off / Caught Stealing buttons above — shown here for reference.</p>
     </section>`;
 }
 
 function wireTallyWidget(root, a, rerender) {
-  if (!a.tally) a.tally = { pik: 0, bk: 0, cs: 0, sb: 0 };
+  if (!a.tally) a.tally = { pik: 0, bk: 0, cs: 0, sb: 0, pikAttempts: 0 };
   root.querySelectorAll('[data-tally-inc]').forEach(btn => btn.addEventListener('click', () => {
     const key = btn.dataset.tallyInc;
     a.tally[key] = (a.tally[key] || 0) + 1;
@@ -1169,6 +1293,7 @@ function renderSummary(id) {
       <p>${esc(a.team)} vs ${esc(a.opponent)}</p>
       <span class="badge">${esc(a.endReason || (a.endedAt ? 'Completed' : 'Active'))}</span>
     </section>
+    ${renderRunsWidget(a)}
     <section class="card">
       <div class="stat-grid">
         <div class="stat"><strong>${s.ip}</strong><span>IP</span></div>
@@ -1212,6 +1337,7 @@ function renderSummary(id) {
   });
   wireDecisionFields(app, a, () => renderSummary(id));
   wireTallyWidget(app, a, () => renderSummary(id));
+  wireRunsWidget(app, a, () => renderSummary(id));
   app.querySelectorAll('[data-edit-batter]').forEach(row => row.addEventListener('click', () => {
     const batter = a.batters.find(x => x.id === row.dataset.editBatter);
     if (batter) openOutcomeEditor(a, { existingBatter: batter, onDone: () => renderSummary(id) });
